@@ -1,0 +1,268 @@
+package com.yourorg.sparklog.diff;
+
+import com.fasterxml.jackson.databind.JsonNode;
+
+import java.util.*;
+
+public class ParsedArtifactsRunDiffer {
+
+  public static ParsedArtifactsRunDiff diff(JsonNode parsedA, JsonNode utilA,
+                                            JsonNode parsedB, JsonNode utilB) {
+
+    ParsedArtifactsRunDiff out = new ParsedArtifactsRunDiff();
+
+    // 1) duration (day-before schema has durationMs in parsed)
+    out.appDurationMs = delta(
+        dbl(parsedA, "durationMs", "appDurationMs"),
+        dbl(parsedB, "durationMs", "appDurationMs")
+    );
+
+    // fallback: compute from start/end if duration missing
+    if (out.appDurationMs == null || out.appDurationMs.baseline == null || out.appDurationMs.candidate == null) {
+      Double da = toD(durationFallback(parsedA));
+      Double db = toD(durationFallback(parsedB));
+      out.appDurationMs = delta(da, db);
+    }
+
+    // 2) avgExecutors from utilization.evidence.avgExecutors (as in UtilizationScorer2.java)
+    out.avgExecutors = delta(
+        dbl(path(utilA, "evidence"), "avgExecutors"),
+        dbl(path(utilB, "evidence"), "avgExecutors")
+    );
+
+    // 3) spark conf diff: key is sparkConf map in CompactParsedLog2.java
+    diffSparkConf(out, parsedA, parsedB);
+
+    // 4) match rules: schema-flexible (because your driver-rule section was truncated in uploaded java)
+    diffMatchRules(out, parsedA, parsedB);
+
+    // 5) final match pct: last rule's totalMatchPct
+    out.finalMatchPct = delta(lastRuleMatchPct(parsedA), lastRuleMatchPct(parsedB));
+
+    // 6) insights diff: schema-flexible (recommendations/insights/signals)
+    diffInsights(out, parsedA, utilA, parsedB, utilB);
+
+    // 7) (optional) diff a few numeric fields from utilization.json if present
+    diffUtilNumerics(out, utilA, utilB);
+
+    return out;
+  }
+
+  // ---------------- duration helpers ----------------
+  private static long durationFallback(JsonNode parsed) {
+    long start = lng0(parsed, "startTimeMs", "appStartMs");
+    long end   = lng0(parsed, "endTimeMs", "appEndMs");
+    if (start > 0 && end > 0 && end >= start) return end - start;
+    return lng0(parsed, "durationMs", "appDurationMs");
+  }
+
+  // ---------------- sparkConf diff ----------------
+  private static void diffSparkConf(ParsedArtifactsRunDiff out, JsonNode a, JsonNode b) {
+    Map<String, String> ma = toStringMap(a.get("sparkConf"));
+    Map<String, String> mb = toStringMap(b.get("sparkConf"));
+
+    for (String k : ma.keySet()) if (!mb.containsKey(k)) out.confRemoved.add(k);
+    for (String k : mb.keySet()) if (!ma.containsKey(k)) out.confAdded.add(k);
+
+    for (String k : ma.keySet()) {
+      if (!mb.containsKey(k)) continue;
+      String va = ma.get(k);
+      String vb = mb.get(k);
+      if (!Objects.equals(va, vb)) {
+        ParsedArtifactsRunDiff.ConfChange cc = new ParsedArtifactsRunDiff.ConfChange();
+        cc.key = k;
+        cc.baseline = va;
+        cc.candidate = vb;
+        out.confChanged.add(cc);
+      }
+    }
+
+    Collections.sort(out.confAdded);
+    Collections.sort(out.confRemoved);
+    out.confChanged.sort(Comparator.comparing(x -> x.key));
+  }
+
+  // ---------------- match rules diff ----------------
+  private static void diffMatchRules(ParsedArtifactsRunDiff out, JsonNode a, JsonNode b) {
+    // Try multiple possible arrays (because the file you uploaded is truncated in this section)
+    JsonNode ra = firstArray(a, "matchRules", "ruleMetrics", "rules", "driverRuleMetrics");
+    JsonNode rb = firstArray(b, "matchRules", "ruleMetrics", "rules", "driverRuleMetrics");
+
+    Map<String, JsonNode> ma = ruleMap(ra);
+    Map<String, JsonNode> mb = ruleMap(rb);
+
+    for (String r : ma.keySet()) if (!mb.containsKey(r)) out.rulesOnlyInBaseline.add(r);
+    for (String r : mb.keySet()) if (!ma.containsKey(r)) out.rulesOnlyInCandidate.add(r);
+
+    for (String rule : ma.keySet()) {
+      if (!mb.containsKey(rule)) continue;
+
+      JsonNode A = ma.get(rule);
+      JsonNode B = mb.get(rule);
+
+      Double aTime = dbl(A, "matchTimeSec", "matchTimeSeconds", "matchTime", "timeSec");
+      Double bTime = dbl(B, "matchTimeSec", "matchTimeSeconds", "matchTime", "timeSec");
+
+      Double aPct  = dbl(A, "totalMatchPct", "totalMatchPercentage", "matchPct");
+      Double bPct  = dbl(B, "totalMatchPct", "totalMatchPercentage", "matchPct");
+
+      Long aCand = lng(A, "matchCandidates", "candidates");
+      Long bCand = lng(B, "matchCandidates", "candidates");
+
+      ParsedArtifactsRunDiff.RuleDiff rd = new ParsedArtifactsRunDiff.RuleDiff();
+      rd.rule = rule;
+      rd.matchTimeSec = delta(aTime, bTime);
+      rd.totalMatchPct = delta(aPct, bPct);
+      rd.baselineCandidates = aCand;
+      rd.candidateCandidates = bCand;
+
+      // classify on match-time regression
+      Double pct = (rd.matchTimeSec != null) ? rd.matchTimeSec.pctDelta : null;
+      if (pct != null && pct > 25.0) rd.classification = "REGRESSED";
+      else if (pct != null && pct < -25.0) rd.classification = "IMPROVED";
+      else rd.classification = "UNCHANGED";
+
+      out.ruleDiffs.add(rd);
+    }
+
+    Collections.sort(out.rulesOnlyInBaseline);
+    Collections.sort(out.rulesOnlyInCandidate);
+
+    // sort by absolute match-time delta desc
+    out.ruleDiffs.sort((x, y) -> Double.compare(
+        abs(y.matchTimeSec != null ? y.matchTimeSec.absDelta : null),
+        abs(x.matchTimeSec != null ? x.matchTimeSec.absDelta : null)
+    ));
+  }
+
+  private static Double lastRuleMatchPct(JsonNode parsed) {
+    JsonNode arr = firstArray(parsed, "matchRules", "ruleMetrics", "rules", "driverRuleMetrics");
+    if (arr == null || !arr.isArray() || arr.size() == 0) return null;
+    JsonNode last = arr.get(arr.size() - 1);
+    return dbl(last, "totalMatchPct", "totalMatchPercentage", "matchPct");
+  }
+
+  // ---------------- insights diff ----------------
+  private static void diffInsights(ParsedArtifactsRunDiff out,
+                                  JsonNode parsedA, JsonNode utilA,
+                                  JsonNode parsedB, JsonNode utilB) {
+
+    // Prefer parsed.runInsights.recommendations (your CompactParsedLog2 shows RunInsights.recommendations)
+    Set<String> a = readStringSet(path(parsedA, "runInsights"), "recommendations", "insights");
+    Set<String> b = readStringSet(path(parsedB, "runInsights"), "recommendations", "insights");
+
+    // fallback: utilization signals/insights
+    if (a.isEmpty()) a = readStringSet(utilA, "insights", "signals");
+    if (b.isEmpty()) b = readStringSet(utilB, "insights", "signals");
+
+    for (String s : b) if (!a.contains(s)) out.insightsAdded.add(s);
+    for (String s : a) if (!b.contains(s)) out.insightsRemoved.add(s);
+
+    Collections.sort(out.insightsAdded);
+    Collections.sort(out.insightsRemoved);
+  }
+
+  // ---------------- utilization numeric diffs (optional) ----------------
+  private static void diffUtilNumerics(ParsedArtifactsRunDiff out, JsonNode ua, JsonNode ub) {
+    if (ua == null || ub == null) return;
+    String[] fields = new String[] {"utilizationScore", "parallelismUtil"};
+    for (String f : fields) {
+      if (ua.has(f) && ub.has(f) && ua.get(f).isNumber() && ub.get(f).isNumber()) {
+        out.utilizationNumericDiffs.put(f, delta(ua.get(f).asDouble(), ub.get(f).asDouble()));
+      }
+    }
+  }
+
+  // ---------------- common helpers ----------------
+  private static ParsedArtifactsRunDiff.MetricDelta delta(Double a, Double b) {
+    if (a == null && b == null) return null;
+    ParsedArtifactsRunDiff.MetricDelta d = new ParsedArtifactsRunDiff.MetricDelta();
+    d.baseline = a;
+    d.candidate = b;
+    if (a != null && b != null) {
+      d.absDelta = b - a;
+      d.pctDelta = (Math.abs(a) > 1e-12) ? ((b - a) / a) * 100.0 : null;
+    }
+    return d;
+  }
+
+  private static double abs(Double x) { return x == null ? 0.0 : Math.abs(x); }
+
+  private static Double toD(long x) { return (double) x; }
+
+  private static long lng0(JsonNode n, String... keys) {
+    for (String k : keys) {
+      if (n != null && n.has(k) && n.get(k).isNumber()) return n.get(k).asLong();
+    }
+    return 0L;
+  }
+
+  private static Double dbl(JsonNode n, String... keys) {
+    if (n == null) return null;
+    for (String k : keys) {
+      if (n.has(k) && n.get(k).isNumber()) return n.get(k).asDouble();
+    }
+    return null;
+  }
+
+  private static Long lng(JsonNode n, String... keys) {
+    if (n == null) return null;
+    for (String k : keys) {
+      if (n.has(k) && n.get(k).isNumber()) return n.get(k).asLong();
+    }
+    return null;
+  }
+
+  private static String txt(JsonNode n, String... keys) {
+    if (n == null) return null;
+    for (String k : keys) {
+      if (n.has(k) && n.get(k).isTextual()) return n.get(k).asText();
+    }
+    return null;
+  }
+
+  private static JsonNode path(JsonNode root, String field) {
+    if (root == null) return null;
+    return root.get(field);
+  }
+
+  private static JsonNode firstArray(JsonNode root, String... fields) {
+    if (root == null) return null;
+    for (String f : fields) {
+      JsonNode n = root.get(f);
+      if (n != null && n.isArray()) return n;
+    }
+    return null;
+  }
+
+  private static Map<String, String> toStringMap(JsonNode obj) {
+    Map<String, String> out = new HashMap<>();
+    if (obj == null || !obj.isObject()) return out;
+    obj.fieldNames().forEachRemaining(k -> out.put(k, obj.get(k).asText()));
+    return out;
+  }
+
+  private static Map<String, JsonNode> ruleMap(JsonNode arr) {
+    Map<String, JsonNode> out = new HashMap<>();
+    if (arr == null || !arr.isArray()) return out;
+
+    for (JsonNode r : arr) {
+      String name = txt(r, "rule", "ruleName", "matchRule");
+      if (name != null && !name.isBlank()) out.put(name, r);
+    }
+    return out;
+  }
+
+  private static Set<String> readStringSet(JsonNode root, String... fields) {
+    Set<String> out = new HashSet<>();
+    if (root == null) return out;
+    for (String f : fields) {
+      JsonNode a = root.get(f);
+      if (a != null && a.isArray()) {
+        for (JsonNode x : a) out.add(x.asText());
+        return out;
+      }
+    }
+    return out;
+  }
+}

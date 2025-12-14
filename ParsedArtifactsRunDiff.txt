@@ -1,0 +1,51 @@
+package com.yourorg.sparklog.diff;
+
+import java.util.*;
+
+public class ParsedArtifactsRunDiff {
+
+  public MetricDelta appDurationMs;          // prefers parsed.durationMs, else (end-start)
+  public MetricDelta avgExecutors;           // from utilization.evidence.avgExecutors (day-before schema)
+
+  public MetricDelta finalMatchPct;          // last match rule totalMatchPct
+
+  public List<String> confAdded = new ArrayList<>();
+  public List<String> confRemoved = new ArrayList<>();
+  public List<ConfChange> confChanged = new ArrayList<>();
+
+  public List<String> rulesOnlyInBaseline = new ArrayList<>();
+  public List<String> rulesOnlyInCandidate = new ArrayList<>();
+  public List<RuleDiff> ruleDiffs = new ArrayList<>();
+
+  public List<String> insightsAdded = new ArrayList<>();
+  public List<String> insightsRemoved = new ArrayList<>();
+
+  // Optional: top-level numeric diffs from utilization.json if you want
+  public Map<String, MetricDelta> utilizationNumericDiffs = new LinkedHashMap<>();
+
+  public static class MetricDelta {
+    public Double baseline;
+    public Double candidate;
+    public Double absDelta;
+    public Double pctDelta;
+  }
+
+  public static class ConfChange {
+    public String key;
+    public String baseline;
+    public String candidate;
+  }
+
+  public static class RuleDiff {
+    public String rule;
+
+    public MetricDelta matchTimeSec;
+    public MetricDelta totalMatchPct;
+
+    public Long baselineCandidates;
+    public Long candidateCandidates;
+
+    public String classification; // REGRESSED/IMPROVED/UNCHANGED
+  }
+}
+

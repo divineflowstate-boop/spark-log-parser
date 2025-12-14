@@ -1,0 +1,30 @@
+package com.yourorg.sparklog.diff;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import java.io.File;
+
+public class ParsedArtifactsDiffMain {
+  /**
+   * Usage:
+   *   <parsedA.json> <utilA.json> <parsedB.json> <utilB.json> <outDiff.json>
+   */
+  public static void main(String[] args) throws Exception {
+    if (args.length < 5) {
+      System.err.println("Usage: <parsedA.json> <utilA.json> <parsedB.json> <utilB.json> <outDiff.json>");
+      System.exit(1);
+    }
+
+    ObjectMapper om = new ObjectMapper();
+    JsonNode parsedA = om.readTree(new File(args[0]));
+    JsonNode utilA   = om.readTree(new File(args[1]));
+    JsonNode parsedB = om.readTree(new File(args[2]));
+    JsonNode utilB   = om.readTree(new File(args[3]));
+
+    ParsedArtifactsRunDiff diff = ParsedArtifactsRunDiffer.diff(parsedA, utilA, parsedB, utilB);
+
+    om.writerWithDefaultPrettyPrinter().writeValue(new File(args[4]), diff);
+    System.out.println("Wrote diff to " + args[4]);
+  }
+}
